@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{ email = "jaap@evoso.nl" }]
 keywords = ["apigrunn", "aigrunn", "archive", "conference", "scraper"]
-dependencies = ["httpx>=0.27"]
+dependencies = ["httpx>=0.27", "beautifulsoup4>=4.12"]
 
 [project.urls]
 Homepage = "https://www.aigrunn.org/"

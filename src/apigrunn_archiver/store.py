@@ -24,6 +24,7 @@ from pathlib import Path
 from .errors import IntegrityError, SchemaVersionError
 from .fetcher import FetchResult, Validators
 from .models import Run, Snapshot
+from .parser import ParsedCard
 
 #: Ordered forward migrations; index ``i`` takes the schema from ``i`` to ``i + 1``.
 MIGRATIONS: Sequence[str] = (
@@ -59,6 +60,37 @@ MIGRATIONS: Sequence[str] = (
     );
 
     CREATE INDEX idx_snapshots_url ON snapshots(url, fetched_at);
+    """,
+    # 2: the talk index, derived from the blobs and rebuildable at any time.
+    # Keyed on (blob, url) rather than snapshot, so each distinct version of
+    # a page is parsed once however many runs saw it.
+    """
+    CREATE TABLE parsed_pages (
+        blob_sha256    TEXT NOT NULL REFERENCES blobs(sha256),
+        url            TEXT NOT NULL,
+        parser_version INTEGER NOT NULL,
+        cards          INTEGER NOT NULL,
+        error          TEXT,
+        PRIMARY KEY (blob_sha256, url)
+    );
+
+    CREATE TABLE talk_cards (
+        blob_sha256   TEXT NOT NULL,
+        url           TEXT NOT NULL,
+        position      INTEGER NOT NULL,
+        video_id      TEXT NOT NULL,
+        title         TEXT NOT NULL,
+        speaker       TEXT NOT NULL,
+        description   TEXT NOT NULL,
+        talk_url      TEXT NOT NULL,
+        year          INTEGER,
+        thumbnail_url TEXT,
+        PRIMARY KEY (blob_sha256, url, video_id),
+        FOREIGN KEY (blob_sha256, url)
+            REFERENCES parsed_pages(blob_sha256, url) ON DELETE CASCADE
+    );
+
+    CREATE INDEX idx_talk_cards_video ON talk_cards(video_id);
     """,
 )
 
@@ -349,6 +381,106 @@ class Store:
         rows = self._conn.execute("PRAGMA integrity_check").fetchall()
         messages = [row[0] for row in rows]
         return [] if messages == ["ok"] else messages
+
+    # ------------------------------------------------------------ talk index
+
+    def unindexed_pages(self, parser_version: int) -> list[tuple[str, str, str]]:
+        """``(sha256, url, content_type)`` for good page versions not yet parsed
+        by ``parser_version``."""
+        rows = self._conn.execute(
+            """
+            SELECT s.blob_sha256 AS sha, s.url AS url, MIN(s.run_id) AS run_id
+            FROM snapshots s
+            LEFT JOIN parsed_pages p
+                   ON p.blob_sha256 = s.blob_sha256 AND p.url = s.url
+                  AND p.parser_version = ?
+            WHERE s.error IS NULL AND s.blob_sha256 IS NOT NULL AND p.url IS NULL
+            GROUP BY s.blob_sha256, s.url
+            ORDER BY run_id, s.url
+            """,
+            (parser_version,),
+        ).fetchall()
+        out = []
+        for row in rows:
+            content_type = next(
+                (v for k, v in self.headers(row["run_id"], row["url"]) if k.lower() == "content-type"),
+                "",
+            )
+            out.append((row["sha"], row["url"], content_type))
+        return out
+
+    def save_parse(
+        self,
+        sha256: str,
+        url: str,
+        *,
+        parser_version: int,
+        cards: Sequence[ParsedCard],
+        error: str | None,
+    ) -> None:
+        """Replace the parse result for one page version."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM parsed_pages WHERE blob_sha256 = ? AND url = ?", (sha256, url)
+            )
+            self._conn.execute(
+                "INSERT INTO parsed_pages (blob_sha256, url, parser_version, cards, error) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sha256, url, parser_version, len(cards), error),
+            )
+            self._conn.executemany(
+                """
+                INSERT INTO talk_cards (blob_sha256, url, position, video_id, title, speaker,
+                                        description, talk_url, year, thumbnail_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (sha256, url, i, c.video_id, c.title, c.speaker, c.description, c.url,
+                     c.year, c.thumbnail_url)
+                    for i, c in enumerate(cards)
+                ],
+            )
+
+    def clear_index(self) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM talk_cards")
+            self._conn.execute("DELETE FROM parsed_pages")
+
+    def parsed_snapshots(self) -> list[tuple[int, str, str, str | None]]:
+        """``(run_id, url, sha256, parse_error)`` for every good, indexed snapshot."""
+        rows = self._conn.execute(
+            """
+            SELECT s.run_id, s.url, s.blob_sha256, p.error
+            FROM snapshots s
+            JOIN parsed_pages p ON p.blob_sha256 = s.blob_sha256 AND p.url = s.url
+            WHERE s.error IS NULL
+            ORDER BY s.run_id, s.url
+            """
+        ).fetchall()
+        return [(r["run_id"], r["url"], r["blob_sha256"], r["error"]) for r in rows]
+
+    def cards(self, sha256: str, url: str) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT * FROM talk_cards WHERE blob_sha256 = ? AND url = ? ORDER BY position",
+            (sha256, url),
+        ).fetchall()
+
+    def sightings(self) -> list[sqlite3.Row]:
+        """Per talk: the first and last run any good snapshot listed it in."""
+        return self._conn.execute(
+            """
+            SELECT c.video_id, MIN(s.run_id) AS first_run, MAX(s.run_id) AS last_run
+            FROM talk_cards c
+            JOIN snapshots s ON s.blob_sha256 = c.blob_sha256 AND s.url = c.url
+            WHERE s.error IS NULL
+            GROUP BY c.video_id
+            """
+        ).fetchall()
+
+    def previous_run_id(self, run_id: int) -> int | None:
+        return self._conn.execute(
+            "SELECT MAX(id) FROM runs WHERE id < ?", (run_id,)
+        ).fetchone()[0]
 
 
 def _snapshot(row: sqlite3.Row) -> Snapshot:

@@ -1,4 +1,8 @@
-"""Command-line interface: ``apigrunn-archiver run | runs | show | history | diff | verify | export``."""
+"""Command-line interface for :mod:`apigrunn_archiver`.
+
+Exit codes: 0 success, 1 a page failed / pages differ / archive damaged
+(per command), 2 usage or lookup error, 3 ``run`` saw talks disappear.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,9 @@ from collections.abc import Sequence
 from ._version import __version__
 from .archiver import Archiver
 from .errors import ArchiverError
+from .models import TalkChanges
+
+EXIT_TALKS_REMOVED = 3
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -53,6 +60,26 @@ def _parser() -> argparse.ArgumentParser:
 
     sub.add_parser("verify", help="re-hash every stored page (exit 1 if damaged)")
 
+    talks = sub.add_parser("talks", help="list talks as of a run, or ones the site dropped")
+    which_talks = talks.add_mutually_exclusive_group()
+    which_talks.add_argument("--run", type=int, help="as of this run (default: latest)")
+    which_talks.add_argument(
+        "--gone", action="store_true", help="talks once listed that the site no longer lists"
+    )
+    which_talks.add_argument(
+        "--ever", action="store_true", help="every talk ever seen, with first/last sighting"
+    )
+    talks.add_argument("--year", type=int)
+    talks.add_argument("--track")
+    talks.add_argument("--search", help="substring of title, description or speaker")
+
+    changes = sub.add_parser("changes", help="talks added, removed or edited between runs")
+    changes.add_argument("run_a", type=int)
+    changes.add_argument("run_b", type=int, nargs="?", help="default: latest run")
+
+    reindex = sub.add_parser("reindex", help="re-parse archived HTML into the talk index")
+    reindex.add_argument("--force", action="store_true", help="rebuild from scratch")
+
     export = sub.add_parser("export", help="write runs out as plain .html files")
     export.add_argument("directory")
     which = export.add_mutually_exclusive_group()
@@ -78,8 +105,45 @@ def main(argv: Sequence[str] | None = None) -> int:
                         print(f"  error  {snap.url}: {snap.error}", file=sys.stderr)
                     elif snap.changed:
                         print(f"  changed  {snap.url}")
-                # Non-zero so cron/systemd surfaces a page that went missing.
-                return 0 if result.status == "ok" else 1
+                for url, sha, message in result.parse_errors:
+                    print(f"  unparseable  {url} ({sha[:12]}): {message}", file=sys.stderr)
+                if result.talk_changes is not None:
+                    _print_changes(result.talk_changes, removed_to=sys.stderr)
+                # Non-zero so cron/systemd surfaces a page or talk that went missing.
+                if result.status != "ok":
+                    return 1
+                if result.talk_changes is not None and result.talk_changes.removed:
+                    return EXIT_TALKS_REMOVED
+                return 0
+
+            if args.command == "talks":
+                if args.gone or args.ever:
+                    entries = archiver.archived_talks(gone_only=args.gone)
+                    runs = {r.id: r for r in archiver.runs()}
+                    for entry in entries:
+                        t = entry.talk
+                        if not _matches(t, args):
+                            continue
+                        last = runs[entry.last_seen_run].started_at[:10]
+                        state = "" if entry.present else f"  [gone; last seen run {entry.last_seen_run}, {last}]"
+                        print(f"{t}  ({', '.join(t.tracks)}){state}")
+                else:
+                    for t in archiver.talks(
+                        run_id=args.run, year=args.year, track=args.track, search=args.search
+                    ):
+                        print(f"{t}  ({', '.join(t.tracks)})")
+                return 0
+
+            if args.command == "changes":
+                _print_changes(archiver.talk_changes(args.run_a, args.run_b))
+                return 0
+
+            if args.command == "reindex":
+                indexed = archiver.reindex(force=args.force)
+                print(f"parsed {indexed.parsed} page versions, {len(indexed.errors)} errors")
+                for url, sha, message in indexed.errors:
+                    print(f"  unparseable  {url} ({sha[:12]}): {message}", file=sys.stderr)
+                return 1 if indexed.errors else 0
 
             if args.command == "runs":
                 print(f"{'id':>4}  {'started (UTC)':<25}  {'status':<8}  pages  changed  errors")
@@ -135,6 +199,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     return 2  # unreachable: argparse requires a command
+
+
+def _matches(talk, args: argparse.Namespace) -> bool:
+    if args.year is not None and talk.year != args.year:
+        return False
+    if args.track is not None and args.track not in talk.tracks:
+        return False
+    if args.search:
+        needle = args.search.casefold()
+        haystack = f"{talk.title}\n{talk.description}\n{talk.speaker}".casefold()
+        if needle not in haystack:
+            return False
+    return True
+
+
+def _print_changes(changes: TalkChanges, *, removed_to=None) -> None:
+    print(changes)
+    for talk in changes.added:
+        print(f"  + {talk}")
+    for talk in changes.removed:
+        print(f"  - {talk}", file=removed_to or sys.stdout)
+    for before, after in changes.changed:
+        fields = [
+            name
+            for name in ("title", "speaker", "description", "url", "year", "tracks", "thumbnail_url")
+            if getattr(before, name) != getattr(after, name)
+        ]
+        print(f"  ~ {after}  ({', '.join(fields)} changed)")
+    for url in changes.stale_pages:
+        print(f"  ! stale  {url} (failed or unparseable; using an older copy)")
 
 
 if __name__ == "__main__":

@@ -8,12 +8,13 @@ each page is kept byte for byte, and nothing is ever deleted. If a talk or a who
 page disappears from aigrunn.org, your local copy still has it.
 
 Currently archived: the eight track pages, which together carry the full talk archive.
-No images or CSS.
+No images or CSS. The talks are parsed out of the stored HTML into an index, so you can
+ask which talks the site dropped and when.
 
 ## Usage
 
 ```bash
-apigrunn-archiver run                     # snapshot every page (exit 1 if any page failed)
+apigrunn-archiver run                     # snapshot every page, report talk changes
 apigrunn-archiver run --conditional       # trust ETags; unchanged pages cost a 304
 apigrunn-archiver runs                    # list runs, newest first
 apigrunn-archiver show tech               # latest good copy of /tech
@@ -25,6 +26,13 @@ apigrunn-archiver diff tech 3 7           # unified diff between runs (exit 1 if
 apigrunn-archiver diff tech 3             # ... against the latest good copy
 apigrunn-archiver verify                  # re-hash every stored page (exit 1 if damaged)
 apigrunn-archiver export ~/aigrunn-export --all   # plain .html files, one dir per run
+
+apigrunn-archiver talks                   # the talk archive as of the latest run
+apigrunn-archiver talks --run 4 --year 2024 --track healthcare --search RAG
+apigrunn-archiver talks --gone            # talks the site used to list but no longer does
+apigrunn-archiver talks --ever            # every talk ever seen
+apigrunn-archiver changes 3 7             # talks added / removed / edited between runs
+apigrunn-archiver reindex [--force]       # re-parse stored HTML into the talk index
 ```
 
 `history` lists only transitions, i.e. the first copy, each change of content, the
@@ -52,7 +60,43 @@ with Archiver() as archiver:
     archiver.diff("tech", 3, 7)  # unified diff as a str, "" if identical
     archiver.verify()            # VerifyResult(ok=..., bad_blobs=[...], ...)
     archiver.export("out/", all_runs=True)
+
+    archiver.talks(year=2024, track="healthcare")   # [Talk(...), ...]
+    archiver.talks(run_id=4)                        # as the site listed them in run 4
+    archiver.talk_changes(3, 7)                     # TalkChanges(added=, removed=, changed=, ...)
+    archiver.archived_talks(gone_only=True)         # [ArchivedTalk(talk=, last_seen_run=, ...)]
 ```
+
+## The talk index
+
+`run` parses every page whose HTML changed and prints how the talk archive moved since
+the previous run:
+
+```
+run 8: ok — 8 pages, 2 changed, 2 new blobs, 0 errors
+  changed  https://www.aigrunn.org/tech
+  changed  https://www.aigrunn.org/science
+talks run 7 → 8: +0 added, -1 removed, ~0 changed
+  - [2025] We Put YOLO on a Tractor — What could go wrong? — Wieneke Keller & Navaneeth Krishnan
+```
+
+How it behaves:
+
+- **Talks in a run** means the talks on each page's latest *good* copy as of that run. If
+  `/tech` returns 503 in run 8, its talks are taken from run 7 and `/tech` is reported as
+  **stale**. So a hiccup doesn't look like 66 deleted talks.
+- **Removed vs. changed.** A talk that disappears from every page is *removed*. A talk
+  that loses one track, or whose title, speaker or description is edited, is *changed*.
+- **Markup changes don't lose data.** If the parser can't read a page (`ARCHIVER-E200`),
+  the run still archives the HTML. The failure is recorded and the page counts as stale.
+  Once the parser is fixed, `reindex` re-reads the stored HTML.
+- **Parsing is cheap.** Results are stored per distinct page version, not per run, so
+  a year of daily runs on an unchanged site is parsed exactly 8 times. Pages parsed by an
+  older `PARSER_VERSION` are re-parsed automatically. `reindex --force` rebuilds the
+  whole index.
+
+The index lives in its own two tables (`parsed_pages`, `talk_cards`). It is derived
+entirely from `blobs`, so dropping it loses nothing.
 
 Pages can be named by track slug (`tech`) or full URL.
 
@@ -108,10 +152,23 @@ blob exists, and runs SQLite's `integrity_check`.
 To back up while a run might be in progress, use `sqlite3 archive.db ".backup copy.db"`
 instead of `cp`.
 
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | success |
+| 1 | `run`: a page failed · `diff`: pages differ · `verify`: damage found · `reindex`: a page could not be parsed |
+| 2 | bad arguments, or nothing matches (e.g. no such run) |
+| 3 | `run`: talks disappeared from the site since the previous run |
+
+With cron, any non-zero exit code means you get an email, so a deleted talk is
+reported the morning after it happens.
+
 ## Errors
 
 | Code | Exception | Raised when |
 | --- | --- | --- |
+| `ARCHIVER-E200` | `ParseError` | a page has talk cards but none could be extracted (recorded, not raised, during runs) |
 | `ARCHIVER-E300` | `SchemaVersionError` | the archive is from a newer version |
 | `ARCHIVER-E400` | `SnapshotNotFound` | no snapshot matches the URL / time / run |
 | `ARCHIVER-E500` | `IntegrityError` | a stored blob doesn't match its hash or won't decompress |

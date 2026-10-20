@@ -63,3 +63,31 @@ def test_history_diff_verify_export(db_path, site, tmp_path, capsys):
 
     assert cli.main([*db, "export", str(tmp_path / "out"), "--all"]) == 0
     assert "exported 2 run(s), 16 files" in capsys.readouterr().out
+
+
+def test_run_exits_3_when_talks_disappear(db_path, site, capsys):
+    from .conftest import edit_cards
+
+    db = ["--db", str(db_path)]
+    cli.main([*db, "run"])
+    for track in site.tracks_listing("tP_kg20VAho"):
+        site.override[track] = edit_cards(site.page(track), "tP_kg20VAho", remove=True)
+    capsys.readouterr()
+
+    assert cli.main([*db, "run"]) == cli.EXIT_TALKS_REMOVED
+    captured = capsys.readouterr()
+    assert "-1 removed" in captured.out
+    assert "- [2025] We Put YOLO on a Tractor" in captured.err
+
+    assert cli.main([*db, "talks", "--gone"]) == 0
+    out = capsys.readouterr().out
+    assert "We Put YOLO" in out and "gone; last seen run 1" in out
+
+    assert cli.main([*db, "talks", "--year", "2025"]) == 0
+    assert len(capsys.readouterr().out.splitlines()) == 21
+
+    assert cli.main([*db, "changes", "1"]) == 0
+    assert "- [2025] We Put YOLO" in capsys.readouterr().out
+
+    assert cli.main([*db, "reindex", "--force"]) == 0
+    assert "parsed 10 page versions, 0 errors" in capsys.readouterr().out

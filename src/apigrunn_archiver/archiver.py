@@ -16,16 +16,27 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from . import index
 from ._version import __version__
 from .errors import IntegrityError, SnapshotNotFound
 from .fetcher import DEFAULT_TIMEOUT, build_client, fetch
-from .models import ExportResult, HistoryEntry, Run, RunResult, Snapshot, VerifyResult
+from .models import (
+    ArchivedTalk,
+    ExportResult,
+    HistoryEntry,
+    IndexResult,
+    Run,
+    RunResult,
+    Snapshot,
+    Talk,
+    TalkChanges,
+    VerifyResult,
+)
 from .store import Store
 from .targets import default_targets, resolve
 
 logger = logging.getLogger(__name__)
 
-_CHARSET = re.compile(r"charset=([\w.:-]+)", re.IGNORECASE)
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]")
 
 
@@ -100,6 +111,10 @@ class Archiver:
             status = "partial"
         self._store.finish_run(run_id, status)
 
+        indexed = index.ensure_index(self._store)
+        previous = self._store.previous_run_id(run_id)
+        changes = index.talk_changes(self._store, previous, run_id) if previous else None
+
         result = RunResult(
             run_id=run_id,
             status=status,
@@ -108,6 +123,8 @@ class Archiver:
             new_blobs=new_blobs,
             errors=errors,
             snapshots=snapshots,
+            talk_changes=changes,
+            parse_errors=indexed.errors,
         )
         logger.info("%s", result)
         return result
@@ -172,12 +189,78 @@ class Archiver:
             (v for k, v in self._store.headers(snap.run_id, snap.url) if k.lower() == "content-type"),
             "",
         )
-        match = _CHARSET.search(content_type)
-        encoding = match.group(1) if match else "utf-8"
-        try:
-            return raw.decode(encoding, errors="replace")
-        except LookupError:
-            return raw.decode("utf-8", errors="replace")
+        return index.decode_html(raw, content_type)
+
+    # ---------------------------------------------------------------- talks
+
+    def reindex(self, *, force: bool = False) -> IndexResult:
+        """Parse archived pages into the talk index.
+
+        Runs do this automatically, so this is only needed after upgrading to
+        a version with a changed parser (which it detects by itself) or, with
+        ``force=True``, to rebuild the index from scratch.
+        """
+        return index.ensure_index(self._store, force=force)
+
+    def talks(
+        self,
+        *,
+        run_id: int | None = None,
+        year: int | None = None,
+        track: str | None = None,
+        search: str | None = None,
+    ) -> list[Talk]:
+        """The talks the site listed as of a run (default: the latest run).
+
+        Each page contributes its latest good copy as of that run, so a page
+        that failed in the run still contributes its earlier talks.
+        """
+        run_id = self._resolve_run(run_id)
+        if run_id is None:
+            return []
+        talks = index.talks_in_run(self._store, run_id).values()
+        if year is not None:
+            talks = [t for t in talks if t.year == year]
+        if track is not None:
+            talks = [t for t in talks if track in t.tracks]
+        if search:
+            needle = search.casefold()
+            talks = [
+                t
+                for t in talks
+                if needle in t.title.casefold()
+                or needle in t.description.casefold()
+                or needle in t.speaker.casefold()
+            ]
+        return index.sort_talks(talks)
+
+    def talk_changes(self, from_run: int, to_run: int | None = None) -> TalkChanges:
+        """Talks added, removed and edited between two runs (default: up to latest)."""
+        target = self._resolve_run(to_run)
+        for rid in (from_run, target):
+            if rid is None or self._store.run(rid) is None:
+                raise SnapshotNotFound(
+                    "the archive has no runs" if rid is None else f"no run {rid}"
+                )
+        return index.talk_changes(self._store, from_run, target)
+
+    def archived_talks(self, *, gone_only: bool = False) -> list[ArchivedTalk]:
+        """Every talk ever seen. ``gone_only`` keeps those the site no longer lists."""
+        self._ensure_index()
+        talks = index.archived_talks(self._store)
+        return [t for t in talks if not t.present] if gone_only else talks
+
+    def _ensure_index(self) -> None:
+        # Cheap when up to date: one query finds nothing to parse.
+        index.ensure_index(self._store)
+
+    def _resolve_run(self, run_id: int | None) -> int | None:
+        self._ensure_index()
+        if run_id is None:
+            return self._store.latest_run_id()
+        if self._store.run(run_id) is None:
+            raise SnapshotNotFound(f"no run {run_id}")
+        return run_id
 
     def history(self, url: str, *, everything: bool = False) -> list[HistoryEntry]:
         """The moments ``url``'s archived state changed, oldest first.

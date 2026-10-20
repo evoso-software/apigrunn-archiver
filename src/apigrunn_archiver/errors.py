@@ -6,6 +6,7 @@ rather than reusing or renumbering an existing one.
 
 =====================  ===============================================
 ``ARCHIVER-E000``      :class:`ArchiverError` (base, not raised)
+``ARCHIVER-E200``      :class:`ParseError`
 ``ARCHIVER-E300``      :class:`SchemaVersionError`
 ``ARCHIVER-E400``      :class:`SnapshotNotFound`
 ``ARCHIVER-E500``      :class:`IntegrityError`
@@ -29,6 +30,17 @@ class ArchiverError(Exception):
     def __init__(self, message: str) -> None:
         self.message = message
         super().__init__(f"[{self.code}] {message}")
+
+
+class ParseError(ArchiverError):
+    """A page has talk cards but none could be extracted.
+
+    The site's markup changed and the parser needs updating. During a run or
+    a reindex this is recorded against the page, not raised: the HTML is
+    safely stored and can be re-parsed once the parser is fixed.
+    """
+
+    code = "ARCHIVER-E200"
 
 
 class SchemaVersionError(ArchiverError):

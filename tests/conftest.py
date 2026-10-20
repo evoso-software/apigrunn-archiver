@@ -15,6 +15,31 @@ def fixture_bytes(track: str) -> bytes:
     return (FIXTURES / f"{track}.html").read_bytes()
 
 
+def fixture_html(track: str) -> str:
+    return fixture_bytes(track).decode("utf-8")
+
+
+def edit_cards(html: bytes, video_id: str, *, remove: bool = False, **attrs: str) -> bytes:
+    """Remove, or change ``data-*`` attributes of, the talk card for ``video_id``."""
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html, "html.parser")
+    anchors = [a for a in soup.select("a.talk-card") if video_id in (a.get("href") or "")]
+    assert anchors, f"no card for {video_id}"
+    for anchor in anchors:
+        if remove:
+            anchor.decompose()
+        else:
+            for key, value in attrs.items():
+                anchor[f"data-{key}"] = value
+    return str(soup).encode("utf-8")
+
+
+@pytest.fixture
+def tech_html() -> str:
+    return fixture_html("tech")
+
+
 class FakeSite:
     """An in-memory aigrunn.org serving the saved fixtures.
 
@@ -35,6 +60,12 @@ class FakeSite:
         self.override: dict[str, bytes] = {}
         self.content_type = "text/html; charset=utf-8"
 
+    def page(self, track: str) -> bytes:
+        return self.override.get(track) or fixture_bytes(track)
+
+    def tracks_listing(self, video_id: str) -> list[str]:
+        return [t for t in TRACKS if f"v={video_id}".encode() in self.page(t)]
+
     def etag(self, track: str) -> str:
         return f'"{track}-{self.version}"'
 
@@ -54,7 +85,7 @@ class FakeSite:
             return httpx.Response(304, headers={"ETag": etag})
         return httpx.Response(
             200,
-            content=self.override.get(track) or fixture_bytes(track),
+            content=self.page(track),
             headers={
                 "ETag": etag,
                 "Last-Modified": "Mon, 14 Sep 2026 08:01:00 GMT",

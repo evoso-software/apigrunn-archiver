@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
+
+_SPEAKER_SPLIT = re.compile(r"\s*(?:&|,| and )\s*")
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +43,85 @@ class Snapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class Talk:
+    """A talk as listed on the track pages at some point in the archive.
+
+    ``tracks`` holds the slugs of every track page that listed it.
+    """
+
+    video_id: str
+    title: str
+    speaker: str
+    description: str
+    url: str
+    year: int | None
+    tracks: tuple[str, ...]
+    thumbnail_url: str | None
+
+    @property
+    def speakers(self) -> list[str]:
+        """``speaker`` split into names, best effort ("A & B", "A, B and C")."""
+        if not self.speaker.strip():
+            return []
+        return [p for p in (p.strip() for p in _SPEAKER_SPLIT.split(self.speaker)) if p]
+
+    def __str__(self) -> str:
+        year = self.year or "????"
+        return f"[{year}] {self.title}" + (f" — {self.speaker}" if self.speaker else "")
+
+
+@dataclass(frozen=True, slots=True)
+class TalkChanges:
+    """How the talk archive differs between two runs.
+
+    Each run is read as "every page's latest good copy as of that run", so a
+    page that fails in ``to_run`` keeps its earlier talks rather than making
+    them look deleted. Such pages are listed in ``stale_pages``.
+    """
+
+    from_run: int
+    to_run: int
+    added: list[Talk] = field(default_factory=list)
+    removed: list[Talk] = field(default_factory=list)
+    #: ``(before, after)`` for talks whose details or tracks changed.
+    changed: list[tuple[Talk, Talk]] = field(default_factory=list)
+    #: Pages in ``to_run`` that failed or could not be parsed.
+    stale_pages: list[str] = field(default_factory=list)
+
+    @property
+    def empty(self) -> bool:
+        return not (self.added or self.removed or self.changed)
+
+    def __str__(self) -> str:
+        text = (
+            f"talks run {self.from_run} → {self.to_run}: +{len(self.added)} added, "
+            f"-{len(self.removed)} removed, ~{len(self.changed)} changed"
+        )
+        if self.stale_pages:
+            text += f" ({len(self.stale_pages)} pages stale)"
+        return text
+
+
+@dataclass(frozen=True, slots=True)
+class ArchivedTalk:
+    """A talk the archive has ever seen, and whether the site still lists it."""
+
+    talk: Talk  # the latest version seen
+    first_seen_run: int
+    last_seen_run: int
+    present: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IndexResult:
+    """Outcome of (re)building the talk index."""
+
+    parsed: int
+    #: ``(url, sha256, message)`` for page versions that could not be parsed.
+    errors: list[tuple[str, str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True, slots=True)
 class RunResult:
     """Summary of a finished :meth:`Archiver.run`."""
 
@@ -50,6 +132,10 @@ class RunResult:
     new_blobs: int
     errors: int
     snapshots: list[Snapshot]
+    #: Talk changes since the previous run; ``None`` for the first run.
+    talk_changes: TalkChanges | None = None
+    #: Pages fetched this run whose HTML could not be parsed.
+    parse_errors: list[tuple[str, str, str]] = field(default_factory=list)
 
     def __str__(self) -> str:
         return (
