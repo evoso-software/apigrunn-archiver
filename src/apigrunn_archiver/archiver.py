@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Self
@@ -19,7 +19,7 @@ import httpx
 from . import index
 from ._version import __version__
 from .errors import IntegrityError, SnapshotNotFound
-from .fetcher import DEFAULT_TIMEOUT, build_client, fetch
+from .fetcher import DEFAULT_TIMEOUT, build_client, iter_fetch
 from .models import (
     ArchivedTalk,
     ExportResult,
@@ -76,12 +76,22 @@ class Archiver:
 
     # ------------------------------------------------------------------ run
 
-    def run(self, *, conditional: bool = False) -> RunResult:
+    def run(
+        self,
+        *,
+        conditional: bool = False,
+        on_snapshot: Callable[[Snapshot], None] | None = None,
+    ) -> RunResult:
         """Fetch every target page and record the result as a new run.
 
         By default every page is downloaded in full and deduplicated by hash.
         ``conditional=True`` sends ``If-None-Match``/``If-Modified-Since`` from
         the previous snapshot instead, trusting the server to report changes.
+
+        ``on_snapshot`` is called with each snapshot as soon as it is stored,
+        in target order, error snapshots included. If it raises, the run stops,
+        keeps the pages stored so far, is marked ``failed`` and the exception
+        propagates; that is how a caller cancels a run.
 
         Never raises for network or HTTP failures: those become error
         snapshots and set the run's status to ``partial`` or ``failed``.
@@ -93,10 +103,12 @@ class Archiver:
         new_blobs = 0
         try:
             with build_client(timeout=self._timeout, transport=self._transport) as client:
-                for result in fetch(self._targets, client=client, validators=validators):
+                for result in iter_fetch(self._targets, client=client, validators=validators):
                     snapshot, added = self._store.add_snapshot(run_id, result)
                     snapshots.append(snapshot)
                     new_blobs += added
+                    if on_snapshot is not None:
+                        on_snapshot(snapshot)
         except BaseException:
             # Keep whatever was stored, but don't leave the run marked running.
             self._store.finish_run(run_id, "failed")

@@ -9,7 +9,7 @@ fetch one page at a time.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -82,44 +82,48 @@ def _conditional_headers(validators: Validators | None) -> dict[str, str]:
     return headers
 
 
-def fetch(
+def iter_fetch(
     urls: Iterable[str],
     *,
     client: httpx.Client,
     validators: Mapping[str, Validators] | None = None,
-) -> list[FetchResult]:
-    """Fetch each URL in turn over one connection.
+) -> Iterator[FetchResult]:
+    """Fetch each URL in turn over one connection, yielding as each one lands.
 
     Pass ``validators`` to send conditional requests; without them every page
     is downloaded in full, which is the archive's default because it does not
     trust the server's ETags to notice every change.
     """
     validators = validators or {}
-    results: list[FetchResult] = []
     for url in urls:
         fetched_at = _now()
         try:
             response = client.get(url, headers=_conditional_headers(validators.get(url)))
         except httpx.HTTPError as exc:
             logger.warning("%s: request failed: %s", url, exc)
-            results.append(
-                FetchResult(url=url, fetched_at=fetched_at, status_code=None, error=str(exc))
-            )
+            yield FetchResult(url=url, fetched_at=fetched_at, status_code=None, error=str(exc))
             continue
 
         error = f"HTTP {response.status_code}" if response.status_code >= 400 else None
         if error:
             logger.warning("%s: %s", url, error)
-        results.append(
-            FetchResult(
-                url=url,
-                fetched_at=fetched_at,
-                status_code=response.status_code,
-                final_url=str(response.url),
-                # A 304 has no body; error pages do, and are kept as evidence.
-                content=None if response.status_code == 304 else response.content,
-                headers=list(response.headers.multi_items()),
-                error=error,
-            )
+        yield FetchResult(
+            url=url,
+            fetched_at=fetched_at,
+            status_code=response.status_code,
+            final_url=str(response.url),
+            # A 304 has no body; error pages do, and are kept as evidence.
+            content=None if response.status_code == 304 else response.content,
+            headers=list(response.headers.multi_items()),
+            error=error,
         )
-    return results
+
+
+def fetch(
+    urls: Iterable[str],
+    *,
+    client: httpx.Client,
+    validators: Mapping[str, Validators] | None = None,
+) -> list[FetchResult]:
+    """Fetch each URL in turn; :func:`iter_fetch`, collected into a list."""
+    return list(iter_fetch(urls, client=client, validators=validators))

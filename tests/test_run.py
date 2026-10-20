@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from apigrunn_archiver import Archiver, track_url
+import pytest
+
+from apigrunn_archiver import Archiver, default_targets, track_url
 
 from .conftest import fixture_bytes
 
@@ -140,3 +142,40 @@ def test_raw_bytes_and_declared_charset_are_preserved(archiver, site):
 
     assert archiver.content("tech") == "<p>Café Grünn</p>".encode("latin-1")
     assert archiver.html("tech") == "<p>Café Grünn</p>"
+
+
+def test_on_snapshot_reports_each_page_as_it_is_stored(archiver, site, db_path):
+    site.gone.add("science")
+    site.unreachable.add("hardware")
+    seen = []
+
+    def on_snapshot(snapshot):
+        # Already committed: a separate reader (e.g. a UI thread) can see it.
+        with Archiver(db_path=db_path) as reader:
+            assert len(reader.snapshots(snapshot.run_id)) == len(seen) + 1
+        seen.append(snapshot)
+
+    result = archiver.run(on_snapshot=on_snapshot)
+
+    assert [s.url for s in seen] == default_targets()
+    assert seen == result.snapshots
+    assert {s.url for s in seen if not s.ok} == {track_url("science"), track_url("hardware")}
+
+
+class Cancelled(Exception):
+    pass
+
+
+def test_raising_from_on_snapshot_cancels_the_run(archiver, site):
+    def on_snapshot(snapshot):
+        if snapshot.url == track_url("government"):
+            raise Cancelled
+
+    with pytest.raises(Cancelled):
+        archiver.run(on_snapshot=on_snapshot)
+
+    run = archiver.runs()[0]
+    assert run.status == "failed"
+    assert run.finished_at is not None
+    assert {s.url for s in archiver.snapshots(run.id)} == set(default_targets()[:3])
+    assert len(site.requests) == 3

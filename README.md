@@ -67,6 +67,18 @@ with Archiver() as archiver:
     archiver.archived_talks(gone_only=True)         # [ArchivedTalk(talk=, last_seen_run=, ...)]
 ```
 
+To follow a run as it happens, pass `on_snapshot`. It is called with each page's
+`Snapshot` as soon as it is stored, in target order, failed pages included:
+
+```python
+archiver.run(on_snapshot=lambda s: print(s.url, "ok" if s.ok else s.error))
+```
+
+Each snapshot is committed before the callback runs, so another `Archiver` on the same
+file (in another thread or process) can already read it. To cancel a run, raise from the
+callback: the pages stored so far are kept, the run is marked `failed` and the exception
+propagates. The callback runs on the thread that called `run()`.
+
 ## The talk index
 
 `run` parses every page whose HTML changed and prints how the talk archive moved since
@@ -173,7 +185,8 @@ reported the morning after it happens.
 | `ARCHIVER-E400` | `SnapshotNotFound` | no snapshot matches the URL / time / run |
 | `ARCHIVER-E500` | `IntegrityError` | a stored blob doesn't match its hash or won't decompress |
 
-All inherit from `ArchiverError`. Network and HTTP failures during `run()` never raise.
+All inherit from `ArchiverError`. Network and HTTP failures during `run()` never raise;
+an exception raised by an `on_snapshot` callback does.
 
 ## Scheduling
 
