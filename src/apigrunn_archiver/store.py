@@ -16,7 +16,8 @@ import hashlib
 import json
 import os
 import sqlite3
-from collections.abc import Sequence
+import zlib
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -274,6 +275,16 @@ class Store:
         ).fetchone()
         return _snapshot(row) if row else None
 
+    def url_history(self, url: str) -> list[Snapshot]:
+        """Every snapshot of ``url``, oldest first."""
+        rows = self._conn.execute(
+            "SELECT * FROM snapshots WHERE url = ? ORDER BY fetched_at, run_id", (url,)
+        ).fetchall()
+        return [_snapshot(row) for row in rows]
+
+    def latest_run_id(self) -> int | None:
+        return self._conn.execute("SELECT MAX(id) FROM runs").fetchone()[0]
+
     def snapshots(self, run_id: int) -> list[Snapshot]:
         rows = self._conn.execute(
             "SELECT * FROM snapshots WHERE run_id = ? ORDER BY url", (run_id,)
@@ -306,13 +317,38 @@ class Store:
         ).fetchone()
         if row is None:
             raise IntegrityError(f"blob {sha256} is referenced but missing from the archive")
-        content = _decompress(row["data"], row["compression"])
+        try:
+            content = _decompress(row["data"], row["compression"])
+        except (OSError, EOFError, zlib.error, ValueError) as exc:
+            raise IntegrityError(f"blob {sha256} cannot be decompressed: {exc}") from exc
         if hashlib.sha256(content).hexdigest() != sha256 or len(content) != row["size"]:
             raise IntegrityError(f"blob {sha256} does not match its hash; the archive is damaged")
         return content
 
     def blob_count(self) -> int:
         return self._conn.execute("SELECT COUNT(*) FROM blobs").fetchone()[0]
+
+    def blob_shas(self) -> Iterator[str]:
+        for row in self._conn.execute("SELECT sha256 FROM blobs ORDER BY sha256").fetchall():
+            yield row["sha256"]
+
+    def dangling_blob_refs(self) -> list[tuple[int, str, str]]:
+        """``(run_id, url, sha256)`` for snapshots whose blob row is missing."""
+        rows = self._conn.execute(
+            """
+            SELECT s.run_id, s.url, s.blob_sha256 FROM snapshots s
+            LEFT JOIN blobs b ON b.sha256 = s.blob_sha256
+            WHERE s.blob_sha256 IS NOT NULL AND b.sha256 IS NULL
+            ORDER BY s.run_id, s.url
+            """
+        ).fetchall()
+        return [(row["run_id"], row["url"], row["blob_sha256"]) for row in rows]
+
+    def integrity_check(self) -> list[str]:
+        """SQLite's own page-level check; ``[]`` when the file is sound."""
+        rows = self._conn.execute("PRAGMA integrity_check").fetchall()
+        messages = [row[0] for row in rows]
+        return [] if messages == ["ok"] else messages
 
 
 def _snapshot(row: sqlite3.Row) -> Snapshot:

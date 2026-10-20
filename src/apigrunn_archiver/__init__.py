@@ -12,7 +12,7 @@ SHA-256, so the archive survives the site deleting or rewriting its pages.
 from ._version import __version__
 from .archiver import Archiver
 from .errors import ArchiverError, IntegrityError, SchemaVersionError, SnapshotNotFound
-from .models import Run, RunResult, Snapshot
+from .models import ExportResult, HistoryEntry, Run, RunResult, Snapshot, VerifyResult
 from .store import SCHEMA_VERSION, Store, default_db_path
 from .targets import BASE_URL, TRACKS, default_targets, track_url
 
@@ -22,6 +22,8 @@ __all__ = [
     "TRACKS",
     "Archiver",
     "ArchiverError",
+    "ExportResult",
+    "HistoryEntry",
     "IntegrityError",
     "Run",
     "RunResult",
@@ -29,6 +31,7 @@ __all__ = [
     "Snapshot",
     "SnapshotNotFound",
     "Store",
+    "VerifyResult",
     "__version__",
     "default_db_path",
     "default_targets",

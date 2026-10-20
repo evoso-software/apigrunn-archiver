@@ -1,4 +1,4 @@
-"""Command-line interface: ``apigrunn-archiver run | runs | show``."""
+"""Command-line interface: ``apigrunn-archiver run | runs | show | history | diff | verify | export``."""
 
 from __future__ import annotations
 
@@ -38,6 +38,26 @@ def _parser() -> argparse.ArgumentParser:
     when.add_argument("--at", help="ISO date or datetime; latest snapshot at or before it")
     when.add_argument("--run", type=int, help="the snapshot from this run id")
     show.add_argument("--raw", action="store_true", help="write the exact bytes to stdout")
+
+    history = sub.add_parser("history", help="when a page changed, failed or recovered")
+    history.add_argument("page", help="track slug (e.g. tech) or full URL")
+    history.add_argument("-a", "--all", action="store_true", help="list every snapshot")
+
+    diff = sub.add_parser(
+        "diff", help="unified diff of a page between two runs (exit 1 if they differ)"
+    )
+    diff.add_argument("page", help="track slug (e.g. tech) or full URL")
+    diff.add_argument("run_a", type=int)
+    diff.add_argument("run_b", type=int, nargs="?", help="default: latest good snapshot")
+    diff.add_argument("-U", "--context", type=int, default=3, help="lines of context")
+
+    sub.add_parser("verify", help="re-hash every stored page (exit 1 if damaged)")
+
+    export = sub.add_parser("export", help="write runs out as plain .html files")
+    export.add_argument("directory")
+    which = export.add_mutually_exclusive_group()
+    which.add_argument("--run", type=int, help="run id (default: latest)")
+    which.add_argument("--all", action="store_true", help="every run")
     return parser
 
 
@@ -76,6 +96,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                     sys.stdout.buffer.write(archiver.content(args.page, **kwargs))
                 else:
                     sys.stdout.write(archiver.html(args.page, **kwargs))
+                return 0
+
+            if args.command == "history":
+                for entry in archiver.history(args.page, everything=args.all):
+                    snap = entry.snapshot
+                    kind = entry.kind
+                    if kind == "recovered" and snap.changed:
+                        kind = "recovered, changed"
+                    detail = snap.error or (snap.blob_sha256 or "")[:12]
+                    print(f"run {snap.run_id:>4}  {snap.fetched_at}  {kind:<18}  {detail}")
+                return 0
+
+            if args.command == "diff":
+                text = archiver.diff(args.page, args.run_a, args.run_b, context=args.context)
+                sys.stdout.write(text)
+                return 1 if text else 0
+
+            if args.command == "verify":
+                result = archiver.verify()
+                print(result)
+                for sha, reason in result.bad_blobs:
+                    print(f"  bad blob  {sha}: {reason}", file=sys.stderr)
+                for run_id, url, sha in result.dangling:
+                    print(f"  missing   {sha} (run {run_id}, {url})", file=sys.stderr)
+                for message in result.sqlite_errors:
+                    print(f"  sqlite    {message}", file=sys.stderr)
+                return 0 if result.ok else 1
+
+            if args.command == "export":
+                exported = archiver.export(args.directory, run_id=args.run, all_runs=args.all)
+                print(
+                    f"exported {len(exported.runs)} run(s), {exported.files} files "
+                    f"to {args.directory} ({exported.skipped} failed snapshots in manifests only)"
+                )
                 return 0
     except ArchiverError as exc:
         print(exc, file=sys.stderr)
