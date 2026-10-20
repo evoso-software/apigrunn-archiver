@@ -44,10 +44,10 @@ class ParseError(ArchiverError):
 
 
 class SchemaVersionError(ArchiverError):
-    """The archive was written by a newer version of this library.
+    """The archive was written by a different version of this library.
 
-    Older archives are migrated forward automatically; only a file from the
-    future is refused, since downgrading could lose data.
+    While the package is at 0.x there are no migrations: an archive at any
+    other schema version is refused and left untouched.
     """
 
     code = "ARCHIVER-E300"
@@ -56,10 +56,17 @@ class SchemaVersionError(ArchiverError):
         self.path = path
         self.found = found
         self.supported = supported
+        if found > supported:
+            advice = "Upgrade apigrunn-archiver"
+        else:
+            advice = (
+                "Move the file aside to start a new archive, or keep using the "
+                "apigrunn-archiver version that wrote it"
+            )
         super().__init__(
             f"{path} is at schema version {found}, but this version of "
-            f"apigrunn-archiver only understands up to {supported}. Upgrade "
-            f"apigrunn-archiver; the archive has not been modified."
+            f"apigrunn-archiver only understands version {supported}. {advice}; "
+            f"the archive has not been modified."
         )
 
 

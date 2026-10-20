@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from apigrunn_archiver import Archiver, default_targets, track_url
+from apigrunn_archiver import Archiver, SnapshotNotFound, default_targets, track_url
 
 from .conftest import fixture_bytes
 
@@ -71,10 +71,15 @@ def test_deleted_page_is_recorded_and_old_copy_survives(archiver, site):
     assert archiver.content("tech") == fixture_bytes("tech")
 
 
-def test_error_body_is_kept_as_evidence(archiver, site):
+def test_error_body_is_not_stored(archiver, site):
     site.fail.add("tech")
     result = archiver.run()
-    assert archiver.content("tech", run_id=result.run_id) == b"try later"
+    snap = archiver.snapshot("tech", run_id=result.run_id)
+    assert snap.status_code == 503
+    assert snap.blob_sha256 is None
+    assert snap.body_sha256 is not None  # what came back is still identifiable
+    with pytest.raises(SnapshotNotFound, match="has no body"):
+        archiver.content("tech", run_id=result.run_id)
 
 
 def test_network_error_is_recorded(archiver, site):

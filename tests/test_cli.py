@@ -6,7 +6,7 @@ from apigrunn_archiver import archiver as archiver_module
 from apigrunn_archiver import cli
 from apigrunn_archiver.fetcher import build_client
 
-from .conftest import fixture_bytes
+from .conftest import add_noise, fixture_bytes
 
 
 @pytest.fixture(autouse=True)
@@ -55,6 +55,8 @@ def test_history_diff_verify_export(db_path, site, tmp_path, capsys):
     assert [line.split()[3] for line in out] == ["first", "changed"]
 
     assert cli.main([*db, "diff", "tech", "1", "2"]) == 1
+    assert "- [2025] We Put YOLO on a Tractor" in capsys.readouterr().out
+    assert cli.main([*db, "diff", "tech", "1", "2", "--html"]) == 1
     assert "+<p>v2</p>" in capsys.readouterr().out
     assert cli.main([*db, "diff", "business", "1", "2"]) == 0
 
@@ -91,3 +93,18 @@ def test_run_exits_3_when_talks_disappear(db_path, site, capsys):
 
     assert cli.main([*db, "reindex", "--force"]) == 0
     assert "parsed 10 page versions, 0 errors" in capsys.readouterr().out
+
+
+def test_show_notes_when_stored_copy_is_not_exact(db_path, site, capsys):
+    db = ["--db", str(db_path)]
+    cli.main([*db, "run"])
+    site.override["tech"] = add_noise(fixture_bytes("tech"), "abc")
+    cli.main([*db, "run"])
+    capsys.readouterr()
+
+    assert cli.main([*db, "show", "tech", "--raw"]) == 0
+    captured = capsys.readouterr()
+    assert "run 2 received different bytes with the same talks" in captured.err
+
+    assert cli.main([*db, "show", "tech", "--run", "1"]) == 0
+    assert capsys.readouterr().err == ""

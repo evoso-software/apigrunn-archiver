@@ -112,7 +112,7 @@ def iter_fetch(
             fetched_at=fetched_at,
             status_code=response.status_code,
             final_url=str(response.url),
-            # A 304 has no body; error pages do, and are kept as evidence.
+            # A 304 has no body. Error pages do, but the store keeps only their status.
             content=None if response.status_code == 304 else response.content,
             headers=list(response.headers.multi_items()),
             error=error,

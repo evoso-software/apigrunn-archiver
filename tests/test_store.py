@@ -24,6 +24,20 @@ def test_newer_archive_is_refused_untouched(db_path):
     assert info.value.supported == SCHEMA_VERSION
 
 
+@pytest.mark.parametrize("old", [1, 2])
+def test_older_archive_is_refused_untouched(db_path, old):
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE runs (id INTEGER PRIMARY KEY)")
+        conn.execute(f"PRAGMA user_version = {old}")
+
+    with pytest.raises(SchemaVersionError, match=r"Move the file aside") as info:
+        Store(db_path)
+    assert info.value.found == old
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == old
+        assert [r[0] for r in conn.execute("SELECT name FROM sqlite_master")] == ["runs"]
+
+
 def test_corrupted_blob_is_detected(archiver, db_path):
     archiver.run()
     with sqlite3.connect(db_path) as conn:

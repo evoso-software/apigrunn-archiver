@@ -5,8 +5,10 @@
     ...     print(archiver.run())
     ...     html = archiver.html("tech", at="2026-03-01")
 
-Every run is kept. Page bodies are stored verbatim and deduplicated by
-SHA-256, so the archive survives the site deleting or rewriting its pages.
+Every run is kept. The talks on each page are parsed and versioned, and a
+page's HTML is stored whenever its talks change, so the archive survives the
+site deleting or rewriting its pages without filling up with copies that
+differ only in noise.
 """
 
 from ._version import __version__

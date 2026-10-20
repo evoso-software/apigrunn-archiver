@@ -84,9 +84,12 @@ class Archiver:
     ) -> RunResult:
         """Fetch every target page and record the result as a new run.
 
-        By default every page is downloaded in full and deduplicated by hash.
-        ``conditional=True`` sends ``If-None-Match``/``If-Modified-Since`` from
-        the previous snapshot instead, trusting the server to report changes.
+        By default every page is downloaded in full and parsed. Its HTML is
+        stored only if its talks differ from every copy of the page already
+        stored (or it cannot be parsed); otherwise the snapshot points at the
+        stored copy with the same talks. ``conditional=True`` sends
+        ``If-None-Match``/``If-Modified-Since`` from the previous snapshot
+        instead, trusting the server to report changes.
 
         ``on_snapshot`` is called with each snapshot as soon as it is stored,
         in target order, error snapshots included. If it raises, the run stops,
@@ -101,10 +104,24 @@ class Archiver:
 
         snapshots: list[Snapshot] = []
         new_blobs = 0
+        parse_errors: list[tuple[str, str, str]] = []
         try:
             with build_client(timeout=self._timeout, transport=self._transport) as client:
                 for result in iter_fetch(self._targets, client=client, validators=validators):
-                    snapshot, added = self._store.add_snapshot(run_id, result)
+                    cards, parse_error = [], None
+                    if result.error is None and result.content is not None:
+                        cards, parse_error = index.parse_page(
+                            result.content, result.header("content-type") or "", result.url
+                        )
+                    snapshot, added = self._store.add_snapshot(
+                        run_id,
+                        result,
+                        parser_version=index.PARSER_VERSION,
+                        cards=cards,
+                        parse_error=parse_error,
+                    )
+                    if parse_error is not None:
+                        parse_errors.append((result.url, snapshot.blob_sha256, parse_error))
                     snapshots.append(snapshot)
                     new_blobs += added
                     if on_snapshot is not None:
@@ -123,6 +140,7 @@ class Archiver:
             status = "partial"
         self._store.finish_run(run_id, status)
 
+        # Normally a no-op; catches up blobs parsed by an older parser.
         indexed = index.ensure_index(self._store)
         previous = self._store.previous_run_id(run_id)
         changes = index.talk_changes(self._store, previous, run_id) if previous else None
@@ -136,7 +154,7 @@ class Archiver:
             errors=errors,
             snapshots=snapshots,
             talk_changes=changes,
-            parse_errors=indexed.errors,
+            parse_errors=parse_errors + indexed.errors,
         )
         logger.info("%s", result)
         return result
@@ -185,7 +203,11 @@ class Archiver:
         return snap
 
     def content(self, url: str, **kwargs: object) -> bytes:
-        """Raw bytes of a snapshot, exactly as the server sent them."""
+        """Raw bytes of the HTML stored for a snapshot.
+
+        That is exactly what the server sent when ``snapshot.exact``; otherwise
+        it is an earlier response with the same talks.
+        """
         snap = self.snapshot(url, **kwargs)  # type: ignore[arg-type]
         if snap.blob_sha256 is None:
             raise SnapshotNotFound(
@@ -194,7 +216,7 @@ class Archiver:
         return self._store.blob(snap.blob_sha256)
 
     def html(self, url: str, **kwargs: object) -> str:
-        """A snapshot decoded to text, using the charset the server declared."""
+        """:meth:`content` decoded to text, using the charset the server declared."""
         snap = self.snapshot(url, **kwargs)  # type: ignore[arg-type]
         raw = self.content(snap.url, run_id=snap.run_id)
         content_type = next(
@@ -278,11 +300,13 @@ class Archiver:
         """The moments ``url``'s archived state changed, oldest first.
 
         Only transitions are reported: the first good copy, each change of
-        body, the start of a run of failures and the recovery from one.
+        talks (or new copy that could not be parsed), the start of a run of
+        failures and the recovery from one.
         ``everything=True`` reports every snapshot instead, with ``kind`` set
         to ``same`` or ``failing`` for the ones that would otherwise be hidden.
         """
         url = resolve(url)
+        self._ensure_index()
         entries: list[HistoryEntry] = []
         seen_good = False
         failing = False
@@ -293,7 +317,7 @@ class Archiver:
                 elif failing:
                     kind = "recovered"
                 elif snap.changed:
-                    kind = "changed"
+                    kind = "changed" if snap.page_sha256 is not None else "unparseable"
                 else:
                     kind = "same"
                 seen_good, failing = True, False
@@ -305,24 +329,54 @@ class Archiver:
         return entries
 
     def diff(
-        self, url: str, run_a: int, run_b: int | None = None, *, context: int = 3
+        self,
+        url: str,
+        run_a: int,
+        run_b: int | None = None,
+        *,
+        html: bool = False,
+        context: int = 3,
     ) -> str:
-        """Unified diff of a page between two runs; ``""`` if identical.
+        """What changed on a page between two runs; ``""`` if nothing did.
 
+        By default the talks are compared, one line per talk added (``+``),
+        removed (``-``) or edited (``~``). ``html=True`` gives a unified diff of
+        the stored HTML instead, as does a page that could not be parsed.
         ``run_b`` defaults to the latest good snapshot.
         """
+        self._ensure_index()
         a = self.snapshot(url, run_id=run_a)
         b = self.snapshot(url) if run_b is None else self.snapshot(url, run_id=run_b)
+        fromfile = f"{a.url} (run {a.run_id}, {a.fetched_at})"
+        tofile = f"{b.url} (run {b.run_id}, {b.fetched_at})"
+
+        if not html and a.page_sha256 is not None and b.page_sha256 is not None:
+            if a.page_sha256 == b.page_sha256:
+                return ""
+            before = index.page_talks(self._store, a.page_sha256, a.url)
+            after = index.page_talks(self._store, b.page_sha256, b.url)
+            lines = [f"--- {fromfile}\n", f"+++ {tofile}\n"]
+            lines += [f"+ {after[v]}\n" for v in _by_talk(after, after.keys() - before.keys())]
+            lines += [f"- {before[v]}\n" for v in _by_talk(before, before.keys() - after.keys())]
+            for v in _by_talk(after, before.keys() & after.keys()):
+                fields = changed_fields(before[v], after[v])
+                if fields:
+                    lines.append(f"~ {after[v]}  ({', '.join(fields)} changed)\n")
+            # Same talks, different order.
+            if len(lines) == 2:
+                lines.append("~ talks reordered\n")
+            return "".join(lines)
+
         if a.blob_sha256 == b.blob_sha256:
             return ""
-        lines = difflib.unified_diff(
+        diff = difflib.unified_diff(
             self.html(a.url, run_id=a.run_id).splitlines(keepends=True),
             self.html(b.url, run_id=b.run_id).splitlines(keepends=True),
-            fromfile=f"{a.url} (run {a.run_id}, {a.fetched_at})",
-            tofile=f"{b.url} (run {b.run_id}, {b.fetched_at})",
+            fromfile=fromfile,
+            tofile=tofile,
             n=context,
         )
-        return "".join(line if line.endswith("\n") else line + "\n" for line in lines)
+        return "".join(line if line.endswith("\n") else line + "\n" for line in diff)
 
     def verify(self) -> VerifyResult:
         """Re-hash every stored body and check the database file itself."""
@@ -339,6 +393,7 @@ class Archiver:
             bad_blobs=bad,
             dangling=self._store.dangling_blob_refs(),
             sqlite_errors=self._store.integrity_check(),
+            bad_index=self._store.bad_index_rows(),
         )
 
     def export(
@@ -347,9 +402,11 @@ class Archiver:
         """Write runs out as plain files that need nothing but a browser.
 
         Each run becomes ``run-NNNN/`` holding one ``<host>/<path>.html`` per
-        good snapshot, with the exact bytes the server sent and the fetch time
-        as the file's mtime, plus a ``manifest.json`` describing every
-        snapshot of the run, failed ones included. Defaults to the latest run.
+        good snapshot, with the stored HTML (see :meth:`content`) and the fetch
+        time as the file's mtime, plus a ``manifest.json`` describing every
+        snapshot of the run, failed ones included; its ``exact`` field tells
+        whether a file is byte for byte what the server sent in that run.
+        Defaults to the latest run.
         """
         if run_id is not None and all_runs:
             raise ValueError("pass at most one of 'run_id' and 'all_runs'")
@@ -372,6 +429,7 @@ class Archiver:
             manifest: list[dict[str, object]] = []
             for snap in self._store.snapshots(rid):
                 entry = dataclasses.asdict(snap)
+                entry["exact"] = snap.exact
                 entry["headers"] = self._store.headers(rid, snap.url)
                 entry["file"] = None
                 if snap.ok and snap.blob_sha256 is not None:
@@ -397,6 +455,18 @@ class Archiver:
                 encoding="utf-8",
             )
         return ExportResult(runs=run_ids, files=files, skipped=skipped)
+
+
+_TALK_FIELDS = ("title", "speaker", "description", "url", "year", "tracks", "thumbnail_url")
+
+
+def changed_fields(before: Talk, after: Talk) -> list[str]:
+    """Names of the fields that differ between two versions of a talk."""
+    return [name for name in _TALK_FIELDS if getattr(before, name) != getattr(after, name)]
+
+
+def _by_talk(talks: dict[str, Talk], ids) -> list[str]:
+    return [t.video_id for t in index.sort_talks(talks[v] for v in ids)]
 
 
 def _url_to_relpath(url: str) -> Path:

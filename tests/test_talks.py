@@ -142,17 +142,16 @@ def test_parser_upgrade_reparses_old_pages(archiver, monkeypatch):
     assert archiver.reindex().parsed == 0
 
 
-def test_archive_from_before_the_index_is_indexed_on_open(site, db_path):
-    with Archiver(db_path=db_path, transport=site.transport) as a:
-        a.run()
-    # Turn the file back into a schema-1 archive, as milestone 2 wrote it.
-    with sqlite3.connect(db_path) as conn:
-        conn.executescript(
-            "DROP TABLE talk_cards; DROP TABLE parsed_pages; PRAGMA user_version = 1;"
-        )
+def test_forced_reindex_rebuilds_the_index_from_blobs(archiver, site, db_path):
+    archiver.run()
+    drop_talk(site, YOLO)
+    archiver.run()
+    before = archiver.talks(run_id=1), archiver.talks(), archiver.history("tech")
 
-    with Archiver(db_path=db_path, transport=site.transport) as a:
-        assert len(a.talks()) == 66
+    archiver.reindex(force=True)
+    assert (archiver.talks(run_id=1), archiver.talks(), archiver.history("tech")) == before
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM page_versions").fetchone()[0] == 10
 
 
 def test_talks_on_empty_archive_and_unknown_run(archiver):

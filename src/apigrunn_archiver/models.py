@@ -24,7 +24,14 @@ class Run:
 
 @dataclass(frozen=True, slots=True)
 class Snapshot:
-    """What one URL looked like during one run."""
+    """What one URL looked like during one run.
+
+    ``blob_sha256`` is the stored HTML that stands for this snapshot. It holds
+    the same talks, but when only insignificant bytes changed since that HTML
+    was stored, it is not the exact body received: ``body_sha256`` is the
+    hash of that, and :attr:`exact` tells whether the two are the same.
+    ``page_sha256`` identifies the parsed talks (``None`` if unparseable).
+    """
 
     run_id: int
     url: str
@@ -34,12 +41,20 @@ class Snapshot:
     error: str | None
     etag: str | None
     last_modified: str | None
+    body_sha256: str | None
     blob_sha256: str | None
+    page_sha256: str | None
+    #: The talks differ from the previous good snapshot of this URL (or it is the first).
     changed: bool
 
     @property
     def ok(self) -> bool:
         return self.error is None and self.status_code is not None
+
+    @property
+    def exact(self) -> bool:
+        """The stored HTML is byte for byte what the server sent in this run."""
+        return self.blob_sha256 is not None and self.blob_sha256 == self.body_sha256
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,10 +166,11 @@ class HistoryEntry:
     ``kind`` is one of:
 
     - ``first``: the first good copy of the page
-    - ``changed``: the body differs from the previous good copy
+    - ``changed``: the talks differ from the previous good copy
+    - ``unparseable``: a new copy the parser could not read
     - ``failed``: the page started erroring (or never worked)
     - ``recovered``: a good copy again after failures; check
-      ``snapshot.changed`` to see whether the body differs from before
+      ``snapshot.changed`` to see whether the talks differ from before
     """
 
     kind: str
@@ -172,10 +188,13 @@ class VerifyResult:
     dangling: list[tuple[int, str, str]]
     #: Messages from SQLite's ``PRAGMA integrity_check``; empty when sound.
     sqlite_errors: list[str]
+    #: ``(sha256, reason)`` for damaged talk or page versions; ``reindex --force``
+    #: rebuilds them from the blobs.
+    bad_index: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
-        return not (self.bad_blobs or self.dangling or self.sqlite_errors)
+        return not (self.bad_blobs or self.dangling or self.sqlite_errors or self.bad_index)
 
     def __str__(self) -> str:
         if self.ok:
@@ -183,6 +202,7 @@ class VerifyResult:
         return (
             f"DAMAGED — {self.blobs_checked} blobs checked, {len(self.bad_blobs)} bad, "
             f"{len(self.dangling)} dangling references, "
+            f"{len(self.bad_index)} bad index rows, "
             f"{len(self.sqlite_errors)} SQLite errors"
         )
 

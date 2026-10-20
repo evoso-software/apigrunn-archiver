@@ -35,6 +35,11 @@ def edit_cards(html: bytes, video_id: str, *, remove: bool = False, **attrs: str
     return str(soup).encode("utf-8")
 
 
+def add_noise(html: bytes, token: str) -> bytes:
+    """Change the page the way a CMS does on every request: same talks, new bytes."""
+    return html.replace(b"</body>", f'<script nonce="{token}"></script></body>'.encode(), 1)
+
+
 @pytest.fixture
 def tech_html() -> str:
     return fixture_html("tech")
